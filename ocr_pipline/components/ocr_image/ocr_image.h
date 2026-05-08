@@ -123,4 +123,23 @@ BGRImage cropAndResize(
     int targetWidth, int targetHeight
 );
 
+/**
+ * @brief 从单个方框裁剪小框图像数组
+ * 
+ * 根据方框高度决定裁剪策略：
+ * - 高度 < 48：直接按固定长度裁剪（每 320 像素裁一次，重叠 48 像素）
+ * - 高度 > 48：先等比缩小到高度 48，再按固定长度裁剪
+ * 
+ * @param image 原始 BGR 图像结构体
+ * @param x1 方框左上角 x 坐标
+ * @param y1 方框左上角 y 坐标
+ * @param x2 方框右下角 x 坐标
+ * @param y2 方框右下角 y 坐标
+ * @return std::vector<BGRImage> 裁剪后的小框图像数组
+ */
+std::vector<BGRImage> cropTextLinesFromBox(
+    const BGRImage& image,
+    int x1, int y1, int x2, int y2
+);
+
 #endif // OCR_IMAGE_H

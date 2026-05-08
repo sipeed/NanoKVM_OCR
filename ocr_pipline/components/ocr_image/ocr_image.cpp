@@ -223,3 +223,138 @@ BGRImage cropAndResize(
     
     return result;
 }
+
+/**
+ * @brief 从单个方框裁剪小框图像数组
+ */
+std::vector<BGRImage> cropTextLinesFromBox(
+    const BGRImage& image,
+    int x1, int y1, int x2, int y2
+)
+{
+    std::vector<BGRImage> result;
+    
+    // 参数验证
+    if (!image.isValid()) {
+        printf("Error: Input image is invalid\n");
+        return result;
+    }
+    
+    if (x1 >= x2 || y1 >= y2) {
+        printf("Error: Invalid box region (x1=%d, y1=%d, x2=%d, y2=%d)\n", x1, y1, x2, y2);
+        return result;
+    }
+    
+    // 计算方框尺寸
+    int boxWidth = x2 - x1;
+    int boxHeight = y2 - y1;
+    
+    printf("  Box size: %dx%d (width x height)\n", boxWidth, boxHeight);
+    
+    // 步骤 1: 从原图裁剪出完整的大框图像
+    BGRImage fullBoxImage = cropAndResize(image, x1, y1, x2, y2, boxWidth, boxHeight);
+    
+    if (!fullBoxImage.isValid()) {
+        printf("Error: Failed to crop full box image\n");
+        return result;
+    }
+    
+    // 步骤 2: 根据高度决定裁剪策略
+    if (boxHeight < 48) {
+        // 高度小于 48，直接按固定长度裁剪
+        printf("  Height < 48, cropping with fixed width (320px, overlap 48px), output size: 320x48\n");
+        
+        int cropWidth = 320;
+        int overlap = 48;
+        int step = cropWidth - overlap;
+        
+        // 如果方框宽度小于 320，直接返回完整大框（缩放到 320x48）
+        if (boxWidth <= cropWidth) {
+            printf("  Box width (%d) <= 320, resizing full box to 320x48\n", boxWidth);
+            BGRImage resizedFullBox = cropAndResize(fullBoxImage, 0, 0, boxWidth, boxHeight, 320, 48);
+            result.push_back(resizedFullBox);
+            return result;
+        }
+        
+        // 按固定步长裁剪
+        int numCrops = 0;
+        for (int startX = 0; startX < boxWidth; startX += step) {
+            int endX = std::min(startX + cropWidth, boxWidth);
+            int subBoxWidth = endX - startX;
+            
+            // 裁剪小框并缩放到 320x48
+            BGRImage subBox = cropAndResize(fullBoxImage, startX, 0, endX, boxHeight, 320, 48);
+            
+            if (subBox.isValid()) {
+                result.push_back(subBox);
+                numCrops++;
+            }
+            
+            // 如果已经到达右边界，退出循环
+            if (endX >= boxWidth) {
+                break;
+            }
+        }
+        
+        printf("  Cropped %d sub-boxes from box (all resized to 320x48)\n", numCrops);
+        
+    } else {
+        // 高度大于等于 48，先等比缩小到高度 48
+        printf("  Height >= 48, scaling to height 48 first, output size: 320x48\n");
+        
+        float scaleFactor = 48.0f / boxHeight;
+        int scaledWidth = static_cast<int>(boxWidth * scaleFactor);
+        int scaledHeight = 48;
+        
+        printf("  Scale factor: %.2f, scaled size: %dx%d\n", scaleFactor, scaledWidth, scaledHeight);
+        
+        // 缩放到高度 48
+        BGRImage scaledBox = cropAndResize(fullBoxImage, 0, 0, boxWidth, boxHeight, scaledWidth, scaledHeight);
+        
+        if (!scaledBox.isValid()) {
+            printf("Error: Failed to scale box image\n");
+            return result;
+        }
+        
+        // 如果缩放后宽度小于 320，直接返回缩放后的图像（填充到 320x48）
+        if (scaledWidth <= 320) {
+            printf("  Scaled width (%d) <= 320, padding to 320x48\n", scaledWidth);
+            BGRImage paddedBox = cropAndResize(scaledBox, 0, 0, scaledWidth, scaledHeight, 320, 48);
+            result.push_back(paddedBox);
+            return result;
+        }
+        
+        // 按固定步长裁剪
+        int cropWidth = 320;
+        int overlap = 48;
+        int step = cropWidth - overlap;
+        
+        int numCrops = 0;
+        for (int startX = 0; startX < scaledWidth; startX += step) {
+            int endX = std::min(startX + cropWidth, scaledWidth);
+            
+            // 裁剪小框并缩放到 320x48
+            BGRImage subBox = cropAndResize(scaledBox, startX, 0, endX, scaledHeight, 320, 48);
+            
+            if (subBox.isValid()) {
+                result.push_back(subBox);
+                numCrops++;
+            }
+            
+            // 如果已经到达右边界，退出循环
+            if (endX >= scaledWidth) {
+                break;
+            }
+        }
+        
+        printf("  Cropped %d sub-boxes from scaled box (all resized to 320x48)\n", numCrops);
+    }
+    
+    // 将完整大框图像添加到结果最前面（缩放到 320x48）
+    BGRImage resizedFullBox = cropAndResize(fullBoxImage, 0, 0, boxWidth, boxHeight, 320, 48);
+    result.insert(result.begin(), resizedFullBox);
+    
+    printf("  Total: 1 full box (320x48) + %zu sub-boxes (320x48)\n", result.size() - 1);
+    
+    return result;
+}
