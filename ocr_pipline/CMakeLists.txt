@@ -83,10 +83,26 @@ target_link_libraries(ocr_pipline
     ${OpenCV_LIBS}
 )
 
+# Test executable for standalone OCR recognition
+add_executable(test_rec test/test_rec.cpp)
+target_link_libraries(test_rec
+    ocr_image
+    ocr_rec
+    ${MSP_LIBS}
+    pthread
+    ${OpenCV_LIBS}
+)
+
 set_target_properties(ocr_pipline PROPERTIES
+    BUILD_RPATH "${MSP_LIB_DIR}"
+    INSTALL_RPATH "${MSP_LIB_DIR}"
+)
+
+set_target_properties(test_rec PROPERTIES
     BUILD_RPATH "${MSP_LIB_DIR}"
     INSTALL_RPATH "${MSP_LIB_DIR}"
 )
 
 # Install target
 install(TARGETS ocr_pipline DESTINATION bin)
+install(TARGETS test_rec DESTINATION bin)
