@@ -62,8 +62,8 @@ include_directories(${MSP_INC_DIR})
 link_directories(${MSP_LIB_DIR})
 
 include_directories(${PROJECT_ROOT_DIR}/inc)
-include_directories(${PROJECT_ROOT_DIR}/src)
-include_directories(${PROJECT_ROOT_DIR}/src/3rdparty/eigen3)
+include_directories(${PROJECT_ROOT_DIR}/test_pipline)
+include_directories(${PROJECT_ROOT_DIR}/test_pipline/3rdparty/eigen3)
 
 if (CHIP_AX630C)
     set(OpenCV_DIR ${PROJECT_ROOT_DIR}/third-party/opencv/lib/arm64/glibc/cmake/opencv4)
@@ -81,7 +81,7 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 add_subdirectory(components)
 
 # Main executable
-add_executable(ocr_pipline src/main.cpp)
+add_executable(ocr_pipline test_pipline/ocr_pipline.cpp)
 target_link_libraries(ocr_pipline
     ocr_image
     ocr_det
@@ -92,7 +92,7 @@ target_link_libraries(ocr_pipline
 )
 
 # Test executable for standalone OCR recognition
-add_executable(test_rec test/test_rec.cpp)
+add_executable(test_rec test_rec/test_rec.cpp)
 target_link_libraries(test_rec
     ocr_image
     ocr_rec
@@ -100,6 +100,9 @@ target_link_libraries(test_rec
     pthread
     ${OpenCV_LIBS}
 )
+
+# Image getting application
+add_subdirectory(image_getting)
 
 set_target_properties(ocr_pipline PROPERTIES
     BUILD_RPATH "${MSP_LIB_DIR}"
@@ -111,6 +114,12 @@ set_target_properties(test_rec PROPERTIES
     INSTALL_RPATH "${MSP_LIB_DIR}"
 )
 
+set_target_properties(image_getting PROPERTIES
+    BUILD_RPATH "${MSP_LIB_DIR}"
+    INSTALL_RPATH "${MSP_LIB_DIR}"
+)
+
 # Install target
 install(TARGETS ocr_pipline DESTINATION bin)
 install(TARGETS test_rec DESTINATION bin)
+install(TARGETS image_getting DESTINATION bin)

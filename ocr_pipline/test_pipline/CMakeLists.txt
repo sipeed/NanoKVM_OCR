@@ -1,5 +1,5 @@
 add_executable(ocr_pipline
-    main.cpp
+    ocr_pipline.cpp
 )
 
 # 链接 ocr_image 和 ocr_det 库
