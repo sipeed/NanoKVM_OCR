@@ -15,85 +15,14 @@
 #include "ocr_det.h"
 #include "ocr_rec.h"
 #include "result_writer.h"
+#include "log.h"
 #include <fstream>
 #include <sstream>
 
-// 获取当前进程内存使用信息（单位：KB）
-struct MemoryInfo {
-    long vmRSS;   // 实际使用的物理内存
-    long vmPeak;  // 峰值内存
-    long vmSize;  // 虚拟内存
-};
-
-MemoryInfo getMemoryInfo() {
-    MemoryInfo info = {0, 0, 0};
-    std::ifstream status("/proc/self/status");
-    std::string line;
-    
-    while (std::getline(status, line)) {
-        std::istringstream iss(line);
-        std::string key;
-        long value;
-        
-        if (iss >> key >> value) {
-            if (key == "VmRSS:") {
-                info.vmRSS = value;
-            } else if (key == "VmPeak:") {
-                info.vmPeak = value;
-            } else if (key == "VmSize:") {
-                info.vmSize = value;
-            }
-        }
-    }
-    
-    return info;
-}
-
-// 打印内存使用信息
-void printMemoryUsage(const std::string& step) {
-    MemoryInfo info = getMemoryInfo();
-    printf("[%s] Memory - VmRSS: %.2f MB, VmPeak: %.2f MB, VmSize: %.2f MB\n",
-           step.c_str(),
-           info.vmRSS / 1024.0,
-           info.vmPeak / 1024.0,
-           info.vmSize / 1024.0);
-}
-
-// 时间戳数组，最多支持 50 个步骤
-#define MAX_STEPS 50
-std::chrono::high_resolution_clock::time_point timestamps[MAX_STEPS];
-std::vector<std::string> stepNames;  // 改用 vector 存储字符串
-int currentStep = 0;
-
-// 记录时间戳
-void recordTime(const char* stepName) {
-    if (currentStep < MAX_STEPS) {
-        timestamps[currentStep] = std::chrono::high_resolution_clock::now();
-        stepNames.push_back(std::string(stepName));  // 存储为 std::string
-        currentStep++;
-    }
-}
-
-// 打印所有步骤的耗时
-void printTiming() {
-    printf("\n");
-    printf("==================================================\n");
-    printf("Timing Report\n");
-    printf("==================================================\n");
-    
-    for (int i = 1; i < currentStep; i++) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            timestamps[i] - timestamps[i-1]).count();
-        printf("[%s] Time: %lld ms\n", stepNames[i].c_str(), duration);
-    }
-    
-    // 总耗时
-    auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        timestamps[currentStep-1] - timestamps[0]).count();
-    printf("--------------------------------------------------\n");
-    printf("[Total] Time: %lld ms\n", totalDuration);
-    printf("==================================================\n");
-}
+// 全局标志变量，控制日志输出
+static bool g_enableTimeLog = false;   // 默认关闭时间日志
+static bool g_enableMemLog = false;    // 默认关闭内存日志
+static LogLevel g_logLevel = LogLevel::INFO;  // 默认 INFO 级别
 
 // 全局变量用于控制监控循环
 static std::atomic<bool> g_running(true);
@@ -101,6 +30,39 @@ static std::atomic<bool> g_running(true);
 void signalHandler(int signum) {
     printf("\nReceived signal %d, shutting down...\n", signum);
     g_running = false;
+}
+
+// ============================================
+// 包装函数：兼容旧代码，使用 log 库的功能
+// ============================================
+
+// 包装函数：记录时间戳
+inline void recordTime(const char* stepName) {
+    log_record_time(stepName);
+}
+
+// 包装函数：打印时间统计
+inline void printTiming() {
+    log_print_timing();
+}
+
+// 包装函数：打印内存使用
+inline void printMemoryUsage(const std::string& step) {
+    if (g_enableMemLog) {
+        log_memory(step);
+    }
+}
+
+// 包装函数：打印最终内存总结
+inline void printFinalMemorySummary() {
+    if (g_enableMemLog) {
+        log_final_memory_summary();
+    }
+}
+
+// 包装函数：获取内存信息
+inline MemoryInfo getMemoryInfo() {
+    return get_memory_info();
 }
 
 // 结构体用于存储文件夹信息
@@ -305,6 +267,18 @@ int ocr_pipline(
     bool uploadJson = false,
     std::string mcpUrl = "http://127.0.0.1:8743/v1/observations")
 {
+    // 如果启用了时间日志，初始化性能分析
+    if (g_enableTimeLog) {
+        log_perf_init();
+        log_enable_perf_log(true);
+        recordTime("Start");
+    }
+    
+    // 如果启用了内存日志，也启用性能分析
+    if (g_enableMemLog) {
+        log_enable_perf_log(true);
+    }
+    
     // 从输入路径生成输出路径：去掉后缀名，添加 _output
     std::string inputBase = inputImagePath;
     size_t lastDot = inputBase.find_last_of('.');
@@ -313,69 +287,72 @@ int ocr_pipline(
     }
     std::string outputPath = inputBase + "_output";
     
-    printf("========================================\n");
-    printf("OCR Pipeline Started\n");
-    printf("========================================\n");
-    printf("Detection Model: %s\n", detModelPath.c_str());
-    printf("Recognition Model: %s\n", recModelPath.c_str());
-    printf("Dictionary: %s\n", dictPath.c_str());
-    printf("Input: %s\n", inputImagePath.c_str());
-    printf("Output: %s\n", outputPath.c_str());
-    printf("Save Images: %s\n", saveImages ? "yes" : "no");
-    printf("Save JSON: %s\n", saveJson ? "yes" : "no");
-    printf("Upload JSON: %s", uploadJson ? "yes" : "no");
+    log_info("ocr_pipeline", "========================================");
+    log_info("ocr_pipeline", "OCR Pipeline Started");
+    log_info("ocr_pipeline", "========================================");
+    log_info("ocr_pipeline", "Detection Model: %s", detModelPath.c_str());
+    log_info("ocr_pipeline", "Recognition Model: %s", recModelPath.c_str());
+    log_info("ocr_pipeline", "Dictionary: %s", dictPath.c_str());
+    log_info("ocr_pipeline", "Input: %s", inputImagePath.c_str());
+    log_info("ocr_pipeline", "Output: %s", outputPath.c_str());
+    log_info("ocr_pipeline", "Save Images: %s", saveImages ? "yes" : "no");
+    log_info("ocr_pipeline", "Save JSON: %s", saveJson ? "yes" : "no");
     if (uploadJson) {
-        printf(" (%s)\n", mcpUrl.c_str());
+        log_info("ocr_pipeline", "Upload JSON: yes (%s)", mcpUrl.c_str());
     } else {
-        printf("\n");
+        log_info("ocr_pipeline", "Upload JSON: no");
     }
-    printf("========================================\n\n");
+    log_info("ocr_pipeline", "Time Log: %s", g_enableTimeLog ? "enabled" : "disabled");
+    log_info("ocr_pipeline", "Mem Log: %s", g_enableMemLog ? "enabled" : "disabled");
+    log_info("ocr_pipeline", "========================================");
+    log_info("ocr_pipeline", "");
     
     // 记录初始内存
     printMemoryUsage("Start");
     
     // 步骤 1: 加载 OcrDetNPU 模型
-    printf("Step 1: Loading OCR detection model to NPU...\n");
+    log_info("ocr_det", "Step 1: Loading OCR detection model to NPU...");
     OcrDetNPU detector(detModelPath);
     
     if (!detector.isModelLoaded()) {
-        printf("Error: Failed to load model!\n");
+        log_error("ocr_det", "Failed to load model!");
         return -1;
     }
-    printf("Model loaded successfully!\n");
+    log_info("ocr_det", "Model loaded successfully!");
     recordTime("Step 1 - Load Model");
     
     // 记录模型加载后的基础内存（包含 SDK 开销）
     MemoryInfo baseMemory = getMemoryInfo();
-    printf("\n[Memory Analysis] NPU SDK base memory: %.2f MB\n", baseMemory.vmRSS / 1024.0);
-    printf("  Note: AXERA SDK pre-allocates memory pools for performance.\n");
-    printf("  This is normal even for small models.\n");
-    printf("\n");
+    log_info("memory", "");
+    log_info("memory", "[Memory Analysis] NPU SDK base memory: %.2f MB", baseMemory.vmRSS / 1024.0);
+    log_info("memory", "  Note: AXERA SDK pre-allocates memory pools for performance.");
+    log_info("memory", "  This is normal even for small models.");
+    log_info("memory", "");
 
     // 步骤 2: 加载图像并转换为 BGR
-    printf("Step 2: Loading image and converting to BGR...\n");
+    log_info("ocr_image", "Step 2: Loading image and converting to BGR...");
     OCRImage image(inputImagePath);
     
     if (!image.isLoaded()) {
-        printf("Error: Failed to load image!\n");
+        log_error("ocr_image", "Failed to load image!");
         return -1;
     }
     
-    printf("Image loaded successfully!\n");
-    printf("  Size: %dx%d\n", image.getWidth(), image.getHeight());
+    log_info("ocr_image", "Image loaded successfully!");
+    log_info("ocr_image", "  Size: %dx%d", image.getWidth(), image.getHeight());
     recordTime("Step 2 - Load Image");
-    printf("\n");
+    log_info("ocr_image", "");
 
     // 步骤 3: 获取 BGR 图像
-    printf("Step 3: Getting BGR image structure...\n");
+    log_info("ocr_image", "Step 3: Getting BGR image structure...");
     BGRImage bgrImage = image.getImage();
-    printf("BGR image: %dx%d, %d channels\n", 
+    log_info("ocr_image", "BGR image: %dx%d, %d channels", 
            bgrImage.width, bgrImage.height, bgrImage.channels);
     recordTime("Step 3 - Get BGR Image");
-    printf("\n");
+    log_info("ocr_image", "");
 
     // 步骤 4: 计算分块裁剪参数
-    printf("Step 4: Calculating tile crop regions...\n");
+    log_info("ocr_crop", "Step 4: Calculating tile crop regions...");
     
     // 参数设置：缩小倍数 2，重叠区域 20 像素，输出尺寸 640x480
     float scaleFactor = 2.0f;
@@ -391,26 +368,28 @@ int ocr_pipline(
     );
     
     if (cropRegions.empty()) {
-        printf("Error: No valid crop regions generated!\n");
+        log_error("ocr_crop", "No valid crop regions generated!");
         return -1;
     }
     
-    printf("Total crop regions: %zu\n", cropRegions.size());
+    log_info("ocr_crop", "Total crop regions: %zu", cropRegions.size());
     recordTime("Step 4 - Calculate Crop Regions");
-    printf("\n");
+    log_info("ocr_crop", "");
 
     // 步骤 5: 对每个裁剪区域运行 NPU 推理
-    printf("Step 5: Running NPU inference on each crop region...\n");
+    log_info("ocr_det", "Step 5: Running NPU inference on each crop region...");
     std::vector<cv::Mat> heatmaps;
     
     // 记录推理前的内存状态
     MemoryInfo beforeInference = getMemoryInfo();
-    printf("\n[Memory Before Inference] VmRSS: %.2f MB, VmPeak: %.2f MB\n",
+    log_info("memory", "");
+    log_info("memory", "[Memory Before Inference] VmRSS: %.2f MB, VmPeak: %.2f MB",
            beforeInference.vmRSS / 1024.0, beforeInference.vmPeak / 1024.0);
     
     for (size_t i = 0; i < cropRegions.size(); i++) {
         const CropRegion& region = cropRegions[i];
-        printf("\nProcessing region %zu/%zu [%d,%d,%d,%d]...\n", 
+        log_info("ocr_det", "");
+        log_info("ocr_det", "Processing region %zu/%zu [%d,%d,%d,%d]...", 
                i + 1, cropRegions.size(), 
                region.x1, region.y1, region.x2, region.y2);
         
@@ -425,20 +404,20 @@ int ocr_pipline(
         );
         
         if (!croppedImage.isValid()) {
-            printf("  Warning: Failed to crop region %zu, skipping...\n", i);
+            log_error("ocr_crop", "  Warning: Failed to crop region %zu, skipping...", i);
             continue;
         }
         
         // 记录裁剪完成时间
         recordTime(("Step 5." + std::to_string(i + 1) + " - Crop").c_str());
         
-        printf("  Cropped image: %dx%d\n", croppedImage.width, croppedImage.height);
+        log_info("ocr_crop", "  Cropped image: %dx%d", croppedImage.width, croppedImage.height);
         
         // 运行 NPU 推理
         cv::Mat heatmap = detector.detect(croppedImage, targetWidth, targetHeight);
         
         if (heatmap.empty()) {
-            printf("  Warning: Failed to generate heatmap for region %zu, skipping...\n", i);
+            log_error("ocr_det", "  Warning: Failed to generate heatmap for region %zu, skipping...", i);
             continue;
         }
         
@@ -447,83 +426,85 @@ int ocr_pipline(
         
         // 每次推理后记录内存
         MemoryInfo currentMem = getMemoryInfo();
-        printf("  [Memory after region %zu] VmRSS: %.2f MB, VmPeak: %.2f MB\n",
+        log_info("memory", "  [Memory after region %zu] VmRSS: %.2f MB, VmPeak: %.2f MB",
                i + 1, currentMem.vmRSS / 1024.0, currentMem.vmPeak / 1024.0);
         
         heatmaps.push_back(heatmap);
-        printf("  Heatmap generated: %dx%d, type=CV_32FC1\n", heatmap.cols, heatmap.rows);
+        log_info("ocr_det", "  Heatmap generated: %dx%d, type=CV_32FC1", heatmap.cols, heatmap.rows);
     }
     
-    printf("\nTotal heatmaps generated: %zu\n", heatmaps.size());
+    log_info("ocr_det", "");
+    log_info("ocr_det", "Total heatmaps generated: %zu", heatmaps.size());
     recordTime("Step 5 - NPU Inference");
     
     // 记录推理后的内存状态
     MemoryInfo afterInference = getMemoryInfo();
-    printf("\n[Memory After Inference] VmRSS: %.2f MB, VmPeak: %.2f MB\n",
+    log_info("memory", "");
+    log_info("memory", "[Memory After Inference] VmRSS: %.2f MB, VmPeak: %.2f MB",
            afterInference.vmRSS / 1024.0, afterInference.vmPeak / 1024.0);
-    printf("[Memory Increase] VmRSS: +%.2f MB, VmPeak: +%.2f MB\n",
+    log_info("memory", "[Memory Increase] VmRSS: +%.2f MB, VmPeak: +%.2f MB",
            (afterInference.vmRSS - beforeInference.vmRSS) / 1024.0,
            (afterInference.vmPeak - beforeInference.vmPeak) / 1024.0);
     printMemoryUsage("Step 5 - After All Inferences");
-    printf("\n");
+    log_info("memory", "");
 
     // 步骤 6: 将所有热力图拼接为原图尺寸（获取热力图数据）
-    printf("Step 6: Merging heatmaps to original size...\n");
+    log_info("ocr_merge", "Step 6: Merging heatmaps to original size...");
     HeatmapData mergedHeatmap = mergeHeatmaps(bgrImage, heatmaps, cropRegions);
     
     if (!mergedHeatmap.checkValid()) {
-        printf("Error: Failed to merge heatmaps!\n");
+        log_error("ocr_merge", "Failed to merge heatmaps!");
         return -1;
     }
     
-    printf("Merged heatmap: %dx%d, channels=%d\n", 
+    log_info("ocr_merge", "Merged heatmap: %dx%d, channels=%d", 
            mergedHeatmap.width, mergedHeatmap.height, mergedHeatmap.channels);
     recordTime("Step 6 - Merge Heatmaps");
     printMemoryUsage("Step 6 - After Merge");
-    printf("\n");
+    log_info("ocr_merge", "");
     
     // 步骤 7: 从热力图提取边界框
-    printf("Step 7: Extracting bounding boxes from heatmap...\n");
+    log_info("ocr_postprocess", "Step 7: Extracting bounding boxes from heatmap...");
     std::vector<BoundingBox> boxes = extractBoxesFromHeatmap(mergedHeatmap, 0.1f, 500, 70);
     
     // 打印所有方框信息
-    printf("  Detected %zu bounding boxes:\n", boxes.size());
+    log_info("ocr_postprocess", "  Detected %zu bounding boxes:", boxes.size());
     for (size_t i = 0; i < boxes.size(); i++) {
-        printf("    Box %zu: [%d, %d, %d, %d], score=%.3f\n",
+        log_info("ocr_postprocess", "    Box %zu: [%d, %d, %d, %d], score=%.3f",
                i, boxes[i].x1, boxes[i].y1, boxes[i].x2, boxes[i].y2, boxes[i].score);
     }
     recordTime("Step 7 - Postprocess");
     printMemoryUsage("Step 7 - After Postprocess");
-    printf("\n");
+    log_info("ocr_postprocess", "");
     
     // 步骤 8: 加载 OCR 识别模型和字典
-    printf("Step 8: Loading OCR recognition model and dictionary...\n");
+    log_info("ocr_rec", "Step 8: Loading OCR recognition model and dictionary...");
     OcrRecNPU recognizer;
     
     if (!recognizer.loadModel(recModelPath)) {
-        printf("Error: Failed to load recognition model!\n");
+        log_error("ocr_rec", "Failed to load recognition model!");
         return -1;
     }
     
     if (!recognizer.loadDictionary(dictPath)) {
-        printf("Error: Failed to load dictionary!\n");
+        log_error("ocr_rec", "Failed to load dictionary!");
         return -1;
     }
     
-    printf("Recognition model and dictionary loaded successfully!\n");
+    log_info("ocr_rec", "Recognition model and dictionary loaded successfully!");
     recordTime("Step 8 - Load Recognition Model");
     printMemoryUsage("Step 8 - After Load Recognition");
-    printf("\n");
+    log_info("ocr_rec", "");
     
     // 步骤 9: 对每个方框进行裁剪、保存、识别
-    printf("Step 9: Cropping, saving and recognizing text in bounding boxes...\n");
+    log_info("ocr_rec", "Step 9: Cropping, saving and recognizing text in bounding boxes...");
     std::vector<RecognitionResultWithIndex> recognitionResults;
     
     // 创建 image 文件夹（仅在 --save 时）
     std::string imageFolder = "image";
     if (saveImages) {
         mkdir(imageFolder.c_str(), 0755);
-        printf("  Created image folder: %s\n", imageFolder);
+        log_info("file_io", "  Created image folder: %s", imageFolder);
     }
     
     for (size_t i = 0; i < boxes.size(); i++) {
@@ -536,7 +517,7 @@ int ocr_pipline(
         );
         
         if (boxImages.empty()) {
-            printf("  Warning: Failed to crop box %zu, skipping...\n", i);
+            log_error("ocr_crop", "  Warning: Failed to crop box %zu, skipping...", i);
             continue;
         }
         
@@ -550,23 +531,23 @@ int ocr_pipline(
                 std::string imagePath = imageFolder + "/" + fileName + ".jpg";
                 
                 if (! saveImage(boxImages[j], imagePath)) {
-                    printf("  Warning: Failed to save image %s, skipping...\n", imagePath.c_str());
+                    log_error("file_io", "  Warning: Failed to save image %s, skipping...", imagePath.c_str());
                     continue;
                 }
             }
-            printf("  Saved %zu cropped image(s) for box %zu\n", boxImages.size(), i);
+            log_info("file_io", "  Saved %zu cropped image(s) for box %zu", boxImages.size(), i);
         }
         
         // 3. 对裁剪的图像进行识别
         if (boxImages.size() == 1) {
             // 只有大框，直接识别
             const BGRImage& boxImage = boxImages[0];
-            printf("  Recognizing box %zu (full box, %dx%d)...\n", i, boxImage.width, boxImage.height);
+            log_info("ocr_rec", "  Recognizing box %zu (full box, %dx%d)...", i, boxImage.width, boxImage.height);
             
             OCRRecResult recResult = recognizer.recognize(boxImage);
             
             if (recResult.success && !recResult.text.empty()) {
-                printf("    -> Text: \"%s\" (confidence: %.4f)\n", 
+                log_info("ocr_rec", "    -> Text: \"%s\" (confidence: %.4f)", 
                        recResult.text.c_str(), recResult.confidence);
                 
                 RecognitionResultWithIndex result;
@@ -578,31 +559,32 @@ int ocr_pipline(
             }
         } else {
             // 存在小框，识别所有小框并合并
-            printf("  Recognizing %zu sub-boxes for box %zu...\n", boxImages.size() - 1, i);
+            log_info("ocr_rec", "  Recognizing %zu sub-boxes for box %zu...", boxImages.size() - 1, i);
             
             std::vector<RecognitionResultWithIndex> subBoxResults;
             for (size_t j = 1; j < boxImages.size(); j++) {
                 const BGRImage& boxImage = boxImages[j];
-                printf("    Recognizing sub-box %zu_%zu (%dx%d)...\n", i, j, boxImage.width, boxImage.height);
+                log_info("ocr_rec", "    Recognizing sub-box %zu_%zu (%dx%d)...", i, j, boxImage.width, boxImage.height);
                 
                 OCRRecResult recResult = recognizer.recognize(boxImage);
                 
                 if (recResult.success && !recResult.text.empty()) {
-                        printf("      -> Text: \"%s\" (confidence: %.4f)\n", 
+                    log_info("ocr_rec", "      -> Text: \"%s\" (confidence: %.4f)", 
                                recResult.text.c_str(), recResult.confidence);
                         
-                        RecognitionResultWithIndex result;
-                        result.boxIndex = i;
-                        result.subBoxIndex = j;
-                        result.box = box;
-                        result.result = recResult;
-                        subBoxResults.push_back(result);
-                    }
+                    RecognitionResultWithIndex result;
+                    result.boxIndex = i;
+                    result.subBoxIndex = j;
+                    result.box = box;
+                    result.result = recResult;
+                    subBoxResults.push_back(result);
+                }
             }
             
             // 合并小框结果
             if (!subBoxResults.empty()) {
-                printf("\n  Merging %zu sub-box results for box %zu...\n", subBoxResults.size(), i);
+                log_info("ocr_rec", "");
+                log_info("ocr_rec", "  Merging %zu sub-box results for box %zu...", subBoxResults.size(), i);
                 std::string mergedText = OcrRecNPU::mergeAllTexts(subBoxResults);
                 
                 RecognitionResultWithIndex mergedResult;
@@ -614,51 +596,52 @@ int ocr_pipline(
                 mergedResult.result.confidence = subBoxResults[0].result.confidence;
                 
                 recognitionResults.push_back(mergedResult);
-                printf("  Box %zu final merged text: \"%s\"\n\n", i, mergedText.c_str());
+                log_info("ocr_rec", "  Box %zu final merged text: \"%s\"", i, mergedText.c_str());
+                log_info("ocr_rec", "");
             }
         }
     }
     
-    printf("Total recognition results: %zu\n", recognitionResults.size());
+    log_info("ocr_rec", "Total recognition results: %zu", recognitionResults.size());
     recordTime("Step 9 - Crop, Save & Recognize");
     printMemoryUsage("Step 9 - After Recognition");
-    printf("\n");
+    log_info("ocr_rec", "");
     
     // 仅在 --save 时
     if (saveImages) {
         // 步骤 10: 将热力图可视化（带方框）
-        printf("Step 10: Visualizing merged heatmap with bounding boxes...\n");
+        log_info("ocr_vis", "Step 10: Visualizing merged heatmap with bounding boxes...");
         BGRImage visImage = visualizeMergedHeatmap(bgrImage, mergedHeatmap, 0.5f, boxes);
         recordTime("Step 10 - Visualize");
         printMemoryUsage("Step 10 - After Visualization");
-        printf("\n");
+        log_info("ocr_vis", "");
     
         // 步骤 11: 保存可视化结果
         std::string visImagePath = outputPath + "_vis.jpg";
-        printf("Step 11: Saving visualization result...\n");
+        log_info("file_io", "Step 11: Saving visualization result...");
         if (saveImage(visImage, visImagePath)) {
-            printf("  Saved: %s\n", visImagePath.c_str());
+            log_info("file_io", "  Saved: %s", visImagePath.c_str());
         } else {
-            printf("  Warning: Failed to save %s\n", visImagePath.c_str());
+            log_error("file_io", "  Warning: Failed to save %s", visImagePath.c_str());
         }
         recordTime("Step 11 - Save Image");
         printMemoryUsage("Step 11 - After Save");
-        printf("\n");
+        log_info("file_io", "");
     } else {
-        printf("Step 11: Skipping visualization save (use --save to enable)\n");
-        printf("\n");
+        log_info("ocr_vis", "Step 11: Skipping visualization save (use --save to enable)");
+        log_info("ocr_vis", "");
     }
     
     // 步骤 12: 对象离开作用域，自动释放 NPU 资源和热力图数据
-    printf("Step 12: Destroying objects...\n");
+    log_info("resource", "Step 12: Destroying objects...");
     // detector, image, heatmaps, mergedHeatmap, boxes 等对象会自动调用析构函数
-    printf("All objects destroyed, resources released automatically\n");
+    log_info("resource", "All objects destroyed, resources released automatically");
     recordTime("Step 12 - Cleanup");
     printMemoryUsage("Step 12 - After Cleanup");
-    printf("\n");
+    log_info("resource", "");
     
     // 步骤 13: 生成 JSON 结果
-    printf("Step 13: Generating JSON result...\n");
+    log_info("json", "Step 13: Generating JSON result...");
     std::string jsonContent = formatResultsToJson(inputImagePath, bgrImage.width, bgrImage.height, recognitionResults, boxes);
     
     // 根据参数决定是否保存或上传
@@ -667,19 +650,19 @@ int ocr_pipline(
         std::string jsonPath;
         if (uploadJson) {
             jsonPath = "/tmp/result.json";
-            printf("  Saving JSON to temp file for upload: %s\n", jsonPath.c_str());
+            log_info("json", "  Saving JSON to temp file for upload: %s", jsonPath.c_str());
         } else {
             jsonPath = outputPath + "_result.json";
-            printf("  Saving JSON to file: %s\n", jsonPath.c_str());
+            log_info("json", "  Saving JSON to file: %s", jsonPath.c_str());
         }
         
         std::ofstream jsonFile(jsonPath);
         if (jsonFile.is_open()) {
             jsonFile << jsonContent;
             jsonFile.close();
-            printf("  Saved JSON result: %s\n", jsonPath.c_str());
+            log_info("json", "  Saved JSON result: %s", jsonPath.c_str());
         } else {
-            printf("  Error: Cannot create JSON file: %s\n", jsonPath.c_str());
+            log_error("json", "  Error: Cannot create JSON file: %s", jsonPath.c_str());
         }
     }
     
@@ -687,34 +670,30 @@ int ocr_pipline(
     if (uploadJson) {
         // 检查是否有识别结果
         if (recognitionResults.empty()) {
-            printf("  Skipping upload: No text recognized (block_count = 0)\n");
+            log_info("upload", "  Skipping upload: No text recognized (block_count = 0)");
         } else {
-            printf("  Uploading JSON to MCP service...\n");
+            log_info("upload", "  Uploading JSON to MCP service...");
             if (uploadJsonToMcp(jsonContent, mcpUrl)) {
-                printf("  Upload successful!\n");
+                log_info("upload", "  Upload successful!");
             } else {
-                printf("  Warning: Upload failed!\n");
+                log_error("upload", "  Warning: Upload failed!");
             }
         }
     }
     
     recordTime("Step 13 - Generate & Save/Upload JSON");
     printMemoryUsage("Step 13 - After Save JSON");
-    printf("\n");
+    log_info("json", "");
 
-    printf("========================================\n");
-    printf("Test completed successfully!\n");
-    printf("========================================\n");
+    log_info("ocr_pipeline", "========================================");
+    log_info("ocr_pipeline", "Test completed successfully!");
+    log_info("ocr_pipeline", "========================================");
     
     // 打印时间统计
     printTiming();
     
     // 打印内存分析总结
-    MemoryInfo finalMemory = getMemoryInfo();
-    printf("\n========================================\n");
-    printf("Memory Usage Summary\n");
-    printf("========================================\n");
-    printf("Final memory (VmRSS): %.2f MB\n", finalMemory.vmRSS / 1024.0);
+    printFinalMemorySummary();
     
     return 0;
 }
@@ -733,7 +712,7 @@ int main(int argc, char** argv)
     std::string dictPath = "/root/models/pp_ocr/ppocr_keys_v1.txt";
     std::string inputImagePath;
     
-    // 解析参数：支持 --save, --folder, --det_model, --rec_model, --dict, --image, --upload, --mcp-url 选项
+    // 解析参数：支持 --save, --folder, --det_model, --rec_model, --dict, --image, --upload, --mcp-url, --time_log, --mem_log, --log 选项
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--save") {
@@ -742,6 +721,12 @@ int main(int argc, char** argv)
             saveJson = false;
         } else if (arg == "--upload") {
             uploadJson = true;
+        } else if (arg == "--time_log") {
+            g_enableTimeLog = true;
+        } else if (arg == "--mem_log") {
+            g_enableMemLog = true;
+        } else if (arg == "--log" && i + 1 < argc) {
+            g_logLevel = string_to_log_level(argv[++i]);
         } else if (arg == "--folder" && i + 1 < argc) {
             folderPath = argv[++i];
         } else if (arg == "--mcp-url" && i + 1 < argc) {
@@ -760,6 +745,9 @@ int main(int argc, char** argv)
             printf("  --save          Save cropped images and visualization result\n");
             printf("  --no-save-json  Do not save JSON to file (default: save)\n");
             printf("  --upload        Upload JSON to MCP service\n");
+            printf("  --time_log      Enable timing logs (default: disabled)\n");
+            printf("  --mem_log       Enable memory monitoring logs (default: disabled)\n");
+            printf("  --log LEVEL     Set log level (none/error/info, default: info)\n");
             printf("  --mcp-url URL   MCP service URL (default: http://127.0.0.1:8743/v1/observations)\n");
             printf("  --folder PATH   Monitor folder for new images (recursive)\n");
             printf("  --det_model PATH Detection model path (default: /root/models/pp_ocr/ch_PP_OCRv3_det_npu.axmodel)\n");
@@ -772,6 +760,7 @@ int main(int argc, char** argv)
             printf("%s --save --image ./test.png --det_model /path/to/model.axmodel\n", argv[0]);
             printf("%s --folder /var/lib/openchronicle/screenshots\n", argv[0]);
             printf("%s --folder /var/lib/screenshots --upload --mcp-url http://192.168.1.100:8743/v1/observations\n", argv[0]);
+            printf("%s --image ./test.png --time_log --mem_log\n", argv[0]);
             return 0;
         }
     }

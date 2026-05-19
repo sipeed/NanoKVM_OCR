@@ -62,6 +62,7 @@ target_link_libraries(ocr_process_app
     ocr_det
     ocr_rec
     result_writer
+    log
     ${MSP_LIBS}
     pthread
     ${OpenCV_LIBS}

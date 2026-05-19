@@ -12,3 +12,6 @@ add_subdirectory(ocr_rec)
 
 # Add result writer component
 add_subdirectory(result_writer)
+
+# Add log component
+add_subdirectory(log)
