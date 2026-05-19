@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <chrono>
 #include <ctime>
+#include <regex>
 
 // 转义 JSON 字符串中的特殊字符
 static std::string escapeJsonString(const std::string& input) {
@@ -27,17 +28,66 @@ static std::string escapeJsonString(const std::string& input) {
     return oss.str();
 }
 
-// 获取当前时间的 RFC3339 格式
+// 获取当前时间的 RFC3339 格式（自动获取系统时区）
 static std::string getCurrentTimeRFC3339() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     std::tm tm_now;
-    gmtime_r(&time_t_now, &tm_now);  // 使用 UTC 时间
+    
+    // 获取本地时间
+    localtime_r(&time_t_now, &tm_now);
+    
+    // 获取时区偏移量（秒）
+    // tm_gmtoff 是 Linux 特有的扩展，表示本地时间与 UTC 的偏移（秒）
+    long tz_offset = tm_now.tm_gmtoff;
+    
+    // 计算时区的小时和分钟
+    int tz_hours = tz_offset / 3600;
+    int tz_minutes = abs(tz_offset % 3600) / 60;
+    
+    // 确定时区符号
+    char tz_sign = (tz_offset >= 0) ? '+' : '-';
     
     std::ostringstream oss;
-    oss << std::put_time(&tm_now, "%Y-%m-%dT%H:%M:%SZ");  // Z 表示 UTC
+    oss << std::put_time(&tm_now, "%Y-%m-%dT%H:%M:%S");
+    oss << tz_sign << std::setw(2) << std::setfill('0') << abs(tz_hours) << ":" 
+        << std::setw(2) << std::setfill('0') << tz_minutes;
     
     return oss.str();
+}
+
+// 从文件名中提取时间（格式：2026-05-19T14-09-28+08-00.jpg -> 2026-05-19T14:09:28+08:00）
+static std::string extractTimeFromFilename(const std::string& filepath) {
+    // 提取文件名（不含路径）
+    size_t lastSlash = filepath.find_last_of('/');
+    std::string filename = (lastSlash != std::string::npos) ? 
+                           filepath.substr(lastSlash + 1) : filepath;
+    
+    // 去掉扩展名
+    size_t lastDot = filename.find_last_of('.');
+    if (lastDot != std::string::npos) {
+        filename = filename.substr(0, lastDot);
+    }
+    
+    // 尝试匹配格式：2026-05-19T14-09-28+08-00 或 2026-05-19T14-09-28
+    std::regex timePattern(R"((\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2}))");
+    std::smatch match;
+    
+    if (std::regex_search(filename, match, timePattern)) {
+        // 提取时间组件
+        std::string year = match[1].str();
+        std::string month = match[2].str();
+        std::string day = match[3].str();
+        std::string hour = match[4].str();
+        std::string minute = match[5].str();
+        std::string second = match[6].str();
+        
+        // 格式化为 RFC3339: 2026-05-19T14:09:28+08:00
+        return year + "-" + month + "-" + day + "T" + hour + ":" + minute + ":" + second + "+08:00";
+    }
+    
+    // 如果文件名中没有时间信息，返回当前时间
+    return getCurrentTimeRFC3339();
 }
 
 std::string formatResultsToJson(
@@ -60,8 +110,8 @@ std::string formatResultsToJson(
     }
     float avgConfidence = (validCount > 0) ? (totalConfidence / validCount) : 0.0f;
     
-    // 获取当前时间
-    std::string currentTime = getCurrentTimeRFC3339();
+    // 从文件名提取时间，如果文件名没有时间信息则使用当前时间
+    std::string currentTime = extractTimeFromFilename(inputImagePath);
     
     // 写入 JSON 内容
     jsonStream << "{\n";
