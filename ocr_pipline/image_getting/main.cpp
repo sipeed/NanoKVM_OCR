@@ -9,6 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include <set>
+#include <map>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -21,9 +22,169 @@
 
 static std::mutex g_imageMutex;
 static cv::Mat g_lastImage;
-static const int MAX_IMAGE_COUNT = 100;
-static const std::string SOCK_PATH = "/run/kvm/vin_ctrl.sock";
-static const std::string OUTPUT_BASE_DIR = "/var/lib/openchronicle/screenshots";
+
+// 配置文件路径
+static const std::string CONFIG_PATH = "/etc/kvm/image_getting.toml";
+
+// 默认配置值
+static const int DEFAULT_CAPTURE_INTERVAL = 10;
+static const int DEFAULT_MAX_IMAGE_COUNT = 5000;
+static const std::string DEFAULT_SOCK_PATH = "/run/kvm/vin_ctrl.sock";
+static const std::string DEFAULT_OUTPUT_BASE_DIR = "/var/lib/openchronicle/screenshots";
+
+// 运行时配置（可从配置文件加载）
+static int CAPTURE_INTERVAL = DEFAULT_CAPTURE_INTERVAL;
+static int MAX_IMAGE_COUNT = DEFAULT_MAX_IMAGE_COUNT;
+static std::string SOCK_PATH = DEFAULT_SOCK_PATH;
+static std::string OUTPUT_BASE_DIR = DEFAULT_OUTPUT_BASE_DIR;
+
+// 确保目录存在
+static bool ensureDirectoryExists(const std::string& path)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        if (mkdir(path.c_str(), 0755) != 0) {
+            std::cerr << "Error: Cannot create directory: " << path << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+// 去除字符串两端的空白字符
+static std::string trim(const std::string& str)
+{
+    size_t first = str.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\r\n");
+    return str.substr(first, last - first + 1);
+}
+
+// 解析简单的 TOML 格式（只支持 key = value 格式）
+static std::map<std::string, std::string> parseSimpleToml(const std::string& content)
+{
+    std::map<std::string, std::string> data;
+    std::istringstream iss(content);
+    std::string line;
+    
+    while (std::getline(iss, line)) {
+        line = trim(line);
+        
+        // 跳过空行和注释
+        if (line.empty() || line[0] == '#' || line[0] == ';') {
+            continue;
+        }
+        
+        // 查找等号
+        size_t eqPos = line.find('=');
+        if (eqPos != std::string::npos) {
+            std::string key = trim(line.substr(0, eqPos));
+            std::string value = trim(line.substr(eqPos + 1));
+            
+            // 去除字符串值的引号
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+                value = value.substr(1, value.size() - 2);
+            }
+            
+            data[key] = value;
+        }
+    }
+    
+    return data;
+}
+
+// 创建默认配置文件
+static void createDefaultConfig(const std::string& configPath)
+{
+    // 确保 /etc/kvm 目录存在
+    size_t lastSlash = configPath.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+        std::string configDir = configPath.substr(0, lastSlash);
+        ensureDirectoryExists(configDir);
+    }
+    
+    std::ofstream file(configPath);
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot create config file: " << configPath << std::endl;
+        return;
+    }
+    
+    file << "# Image Getting Configuration\n";
+    file << "\n";
+    file << "# Capture interval in seconds\n";
+    file << "capture_interval = " << DEFAULT_CAPTURE_INTERVAL << "\n";
+    file << "\n";
+    file << "# Maximum number of images to keep\n";
+    file << "max_image_count = " << DEFAULT_MAX_IMAGE_COUNT << "\n";
+    file << "\n";
+    file << "# Unix socket path for JENC snapshot\n";
+    file << "sock_path = \"" << DEFAULT_SOCK_PATH << "\"\n";
+    file << "\n";
+    file << "# Output base directory for screenshots\n";
+    file << "output_base_dir = \"" << DEFAULT_OUTPUT_BASE_DIR << "\"\n";
+    
+    file.close();
+    std::cout << "Created default config file: " << configPath << std::endl;
+}
+
+// 加载配置文件
+static bool loadConfig(const std::string& configPath)
+{
+    // 检查文件是否存在
+    struct stat st;
+    if (stat(configPath.c_str(), &st) != 0) {
+        std::cout << "Config file not found, creating default..." << std::endl;
+        createDefaultConfig(configPath);
+        // 使用默认值
+        return true;
+    }
+    
+    // 读取文件内容
+    std::ifstream file(configPath);
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open config file: " << configPath << std::endl;
+        return false;
+    }
+    
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string content = buffer.str();
+    file.close();
+    
+    // 解析配置
+    try {
+        auto data = parseSimpleToml(content);
+        
+        // 读取配置值，如果格式不对则使用默认值
+        if (data.count("capture_interval")) {
+            CAPTURE_INTERVAL = std::stoi(data["capture_interval"]);
+        }
+        if (data.count("max_image_count")) {
+            MAX_IMAGE_COUNT = std::stoi(data["max_image_count"]);
+        }
+        if (data.count("sock_path")) {
+            SOCK_PATH = data["sock_path"];
+        }
+        if (data.count("output_base_dir")) {
+            OUTPUT_BASE_DIR = data["output_base_dir"];
+        }
+        
+        std::cout << "Loaded config from: " << configPath << std::endl;
+        std::cout << "  capture_interval = " << CAPTURE_INTERVAL << std::endl;
+        std::cout << "  max_image_count = " << MAX_IMAGE_COUNT << std::endl;
+        std::cout << "  sock_path = " << SOCK_PATH << std::endl;
+        std::cout << "  output_base_dir = " << OUTPUT_BASE_DIR << std::endl;
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: Failed to parse config file: " << e.what() << std::endl;
+        std::cerr << "Creating default config file..." << std::endl;
+        createDefaultConfig(configPath);
+        // 使用默认值
+        return false;
+    }
+}
 
 std::string getCurrentDateTime()
 {
@@ -46,6 +207,17 @@ std::string getCurrentTimeWithTz()
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     auto tm_now = std::localtime(&time_t_now);
     
+    // 获取时区偏移量（秒）
+    // tm_gmtoff 是 Linux 特有的扩展，表示本地时间与 UTC 的偏移（秒）
+    long tz_offset = tm_now->tm_gmtoff;
+    
+    // 计算时区的小时和分钟
+    int tz_hours = tz_offset / 3600;
+    int tz_minutes = abs(tz_offset % 3600) / 60;
+    
+    // 确定时区符号
+    char tz_sign = (tz_offset >= 0) ? '+' : '-';
+    
     std::ostringstream oss;
     oss << std::setfill('0')
         << std::setw(4) << (tm_now->tm_year + 1900) << "-"
@@ -53,7 +225,9 @@ std::string getCurrentTimeWithTz()
         << std::setw(2) << tm_now->tm_mday << "T"
         << std::setw(2) << tm_now->tm_hour << "-"
         << std::setw(2) << tm_now->tm_min << "-"
-        << std::setw(2) << tm_now->tm_sec << "+08-00";
+        << std::setw(2) << tm_now->tm_sec
+        << tz_sign << std::setw(2) << std::setfill('0') << abs(tz_hours) << "-"
+        << std::setw(2) << std::setfill('0') << tz_minutes;
     
     return oss.str();
 }
@@ -98,18 +272,6 @@ std::string generateFilename(int subIndex)
 {
     (void)subIndex;
     return getCurrentTimeWithTz();
-}
-
-bool ensureDirectoryExists(const std::string& path)
-{
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        if (mkdir(path.c_str(), 0755) != 0) {
-            std::cerr << "Error: Cannot create directory: " << path << std::endl;
-            return false;
-        }
-    }
-    return true;
 }
 
 struct FileEntry {
@@ -390,8 +552,6 @@ void imageCaptureThread()
     std::cout << "Using JENC snapshot via Unix socket: " << SOCK_PATH << std::endl;
     
     while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        
         cv::Mat frame = captureImage();
         
         if (frame.empty()) {
@@ -434,6 +594,9 @@ void imageCaptureThread()
                 }
             }
         }
+
+        // 10 seconds sleep
+        std::this_thread::sleep_for(std::chrono::seconds(CAPTURE_INTERVAL));
     }
 }
 
@@ -452,16 +615,19 @@ int main(int argc, char** argv)
     (void)argc;
     (void)argv;
     
+    // 加载配置文件
+    loadConfig(CONFIG_PATH);
+    
     std::cout << "Starting image getting application..." << std::endl;
     std::cout << "Maximum image count: " << MAX_IMAGE_COUNT << std::endl;
     std::cout << "Unix socket path: " << SOCK_PATH << std::endl;
     std::cout << "Output directory: " << OUTPUT_BASE_DIR << std::endl;
     
     std::thread captureThread(imageCaptureThread);
-    std::thread helloThread(helloPrintThread);
+    // std::thread helloThread(helloPrintThread);
     
     captureThread.join();
-    helloThread.join();
+    // helloThread.join();
     
     return 0;
 }
