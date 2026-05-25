@@ -289,23 +289,16 @@ int main(int argc, char** argv)
     printf("\n");
 
     // 步骤 6: 将所有热力图拼接为原图尺寸（获取热力图数据）
-    printf("Step 6: Merging heatmaps to original size...\n");
-    HeatmapData mergedHeatmap = mergeHeatmaps(bgrImage, heatmaps, cropRegions);
+    printf("Step 6: Merging binary heatmaps to original size...\n");
+    cv::Mat mergedBinaryHeatmap = mergeBinaryHeatmaps(bgrImage, heatmaps, cropRegions);
     
-    if (!mergedHeatmap.checkValid()) {
-        printf("Error: Failed to merge heatmaps!\n");
-        return -1;
-    }
-    
-    printf("Merged heatmap: %dx%d, channels=%d\n", 
-           mergedHeatmap.width, mergedHeatmap.height, mergedHeatmap.channels);
     recordTime("Step 6 - Merge Heatmaps");
     printMemoryUsage("Step 6 - After Merge");
     printf("\n");
     
-    // 步骤 7: 从热力图提取边界框
-    printf("Step 7: Extracting bounding boxes from heatmap...\n");
-    std::vector<BoundingBox> boxes = extractBoxesFromHeatmap(mergedHeatmap, 0.1f, 500, 70);
+    // 步骤 7: 从二值热力图提取边界框
+    printf("Step 7: Extracting bounding boxes from binary heatmap...\n");
+    std::vector<BoundingBox> boxes = extractBoxesFromBinaryHeatmap(mergedBinaryHeatmap, 128, 500, 70);
     
     // 打印所有方框信息
     printf("  Detected %zu bounding boxes:\n", boxes.size());
@@ -493,7 +486,7 @@ int main(int argc, char** argv)
     
     // 步骤 11: 将热力图可视化（带方框）
     printf("Step 11: Visualizing merged heatmap with bounding boxes...\n");
-    BGRImage visImage = visualizeMergedHeatmap(bgrImage, mergedHeatmap, 0.5f, boxes);
+    BGRImage visImage = visualizeMergedHeatmap(bgrImage, mergedBinaryHeatmap, 0.5f, boxes);
     recordTime("Step 11 - Visualize");
     printMemoryUsage("Step 11 - After Visualization");
     printf("\n");
@@ -526,13 +519,20 @@ int main(int argc, char** argv)
     
     // 打印内存分析总结
     MemoryInfo finalMemory = getMemoryInfo();
+    
+    // 跟踪 VmRSS 历史最高值（静态变量）
+    static long maxVmRSS = 0;
+    if (finalMemory.vmRSS > maxVmRSS) {
+        maxVmRSS = finalMemory.vmRSS;
+    }
+    
     printf("\n========================================\n");
     printf("Memory Usage Summary\n");
     printf("========================================\n");
     printf("Model size: ~0.9 MB\n");
-    printf("Peak memory (VmPeak): %.2f MB\n", 161.11);
+    printf("Peak memory (Max VmRSS): %.2f MB\n", maxVmRSS / 1024.0);
     printf("Final memory (VmRSS): %.2f MB\n", finalMemory.vmRSS / 1024.0);
-    printf("\n");
+    printf("\nNote: Max VmRSS is the highest actual memory usage during runtime.\n");
     printf("Memory breakdown:\n");
     printf("  - Model weights: ~0.9 MB (%.1f%%)\n", (0.9 / 161.11) * 100);
     printf("  - AXERA SDK base: ~45 MB (%.1f%%)\n", (45.0 / 161.11) * 100);

@@ -15,6 +15,9 @@ int g_currentStep = 0;
 // 全局标志：是否启用性能分析
 static bool g_enablePerfLog = false;
 
+// 跟踪 VmRSS 历史最高值
+static long g_maxVmRSS = 0;
+
 // 初始化日志系统
 void log_init(LogLevel level) {
     g_logLevel = level;
@@ -142,6 +145,12 @@ void log_memory(const std::string& step) {
     if (!g_enablePerfLog) return;
     
     MemoryInfo info = get_memory_info();
+    
+    // 更新 VmRSS 历史最高值
+    if (info.vmRSS > g_maxVmRSS) {
+        g_maxVmRSS = info.vmRSS;
+    }
+    
     printf("[%s] Memory - VmRSS: %.2f MB, VmPeak: %.2f MB, VmSize: %.2f MB\n",
            step.c_str(),
            info.vmRSS / 1024.0,
@@ -157,7 +166,9 @@ void log_final_memory_summary() {
     printf("\n========================================\n");
     printf("Memory Usage Summary\n");
     printf("========================================\n");
+    printf("Peak memory (Max VmRSS): %.2f MB\n", g_maxVmRSS / 1024.0);
     printf("Final memory (VmRSS): %.2f MB\n", finalMemory.vmRSS / 1024.0);
+    printf("\nNote: Max VmRSS is the highest actual memory usage during runtime.\n");
 }
 
 // 记录时间戳

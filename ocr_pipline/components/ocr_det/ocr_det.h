@@ -71,6 +71,48 @@ struct HeatmapData {
         : width(w), height(h), channels(1), data(d), isValid(d != nullptr) {}
     
     /**
+     * @brief 复制构造函数（深拷贝）
+     */
+    HeatmapData(const HeatmapData& other) 
+        : width(other.width), height(other.height), channels(other.channels), isValid(other.isValid) {
+        if (other.data && isValid) {
+            int size = width * height;
+            data = new float[size];
+            memcpy(data, other.data, size * sizeof(float));
+        } else {
+            data = nullptr;
+        }
+    }
+    
+    /**
+     * @brief 赋值运算符（深拷贝）
+     */
+    HeatmapData& operator=(const HeatmapData& other) {
+        if (this != &other) {
+            // 释放现有数据
+            if (data && isValid) {
+                delete[] data;
+                data = nullptr;
+            }
+            
+            // 复制新数据
+            width = other.width;
+            height = other.height;
+            channels = other.channels;
+            isValid = other.isValid;
+            
+            if (other.data && isValid) {
+                int size = width * height;
+                data = new float[size];
+                memcpy(data, other.data, size * sizeof(float));
+            } else {
+                data = nullptr;
+            }
+        }
+        return *this;
+    }
+    
+    /**
      * @brief 析构函数
      */
     ~HeatmapData() {
@@ -200,6 +242,67 @@ BGRImage visualizeMergedHeatmap(
     float alpha = 0.5f,
     const std::vector<BoundingBox>& boxes = std::vector<BoundingBox>()
 );
+
+/**
+ * @brief 将合并后的二值热力图可视化并叠加到原图
+ * 
+ * 用于调试和展示，将二值热力图转换为伪彩色后叠加到原图。
+ * 
+ * @param originalImage 原始 BGR 图像
+ * @param binaryHeatmap 二值热力图（CV_8UC1，值为 0 或 255）
+ * @param alpha 叠加透明度（0.0-1.0，默认 0.5）
+ * @param boxes 边界框列表（可选，用于绘制绿色方框）
+ * @return BGRImage 叠加后的 BGR 图像（原图尺寸）
+ */
+BGRImage visualizeMergedHeatmap(
+    const BGRImage& originalImage,
+    const cv::Mat& binaryHeatmap,
+    float alpha = 0.5f,
+    const std::vector<BoundingBox>& boxes = std::vector<BoundingBox>()
+);
+
+/**
+     * @brief 将 float32 热力图二值化为 uint8
+     * 
+     * 将 NPU 输出的 float32 热力图转换为 uint8 二值图，大幅减少内存占用。
+     * 
+     * @param heatmap 输入热力图（CV_32FC1，单通道浮点型）
+     * @param threshold 二值化阈值（大于此值的像素设为 255，否则为 0）
+     * @return cv::Mat 二值化热力图（CV_8UC1，单通道 uint8）
+     */
+    cv::Mat binarizeHeatmap(const cv::Mat& heatmap, float threshold = 0.1f);
+    
+    /**
+     * @brief 将多个二值热力图拼接为原图尺寸（二值版本）
+     * 
+     * 使用 OR 操作合并多个二值热力图，合并后仍为二值图，内存占用极低。
+     * 
+     * @param originalImage 原始图像（用于获取尺寸）
+     * @param heatmaps 二值热力图向量（每个都是 CV_8UC1，值为 0 或 255）
+     * @param cropRegions 裁剪区域向量
+     * @return cv::Mat 合并后的二值热力图（CV_8UC1）
+     */
+    cv::Mat mergeBinaryHeatmaps(
+        const BGRImage& originalImage,
+        const std::vector<cv::Mat>& heatmaps,
+        const std::vector<CropRegion>& cropRegions);
+    
+    /**
+     * @brief 从二值热力图中提取边界框
+     * 
+     * 直接处理二值图，不需要转换为 float，节省内存。
+     * 
+     * @param binaryHeatmap 二值热力图（CV_8UC1，值为 0 或 255）
+     * @param threshold 二值化阈值（0-255，通常设为 128）
+     * @param minArea 最小连通域面积
+     * @param expandPercent 边界框扩展百分比
+     * @return std::vector<BoundingBox> 检测到的边界框
+     */
+    std::vector<BoundingBox> extractBoxesFromBinaryHeatmap(
+        const cv::Mat& binaryHeatmap,
+        int threshold = 128,
+        int minArea = 500,
+        int expandPercent = 70);
 
 /**
  * @brief 从热力图中提取边界框

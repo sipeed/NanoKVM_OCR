@@ -99,6 +99,158 @@ std::vector<CropRegion> calculateCropRegions(
 }
 
 /**
+ * @brief 将 float32 热力图二值化为 uint8
+ */
+cv::Mat binarizeHeatmap(const cv::Mat& heatmap, float threshold) {
+    cv::Mat binary;
+    cv::threshold(heatmap, binary, threshold, 255.0, cv::THRESH_BINARY);
+    binary.convertTo(binary, CV_8UC1);
+    return binary;
+}
+
+/**
+ * @brief 将多个二值热力图拼接为原图尺寸（二值版本）
+ */
+cv::Mat mergeBinaryHeatmaps(
+    const BGRImage& originalImage,
+    const std::vector<cv::Mat>& heatmaps,
+    const std::vector<CropRegion>& cropRegions)
+{
+    printf("Merging %zu binary heatmaps to original size...\n", heatmaps.size());
+    
+    // 创建二值全图（初始化为 0）
+    cv::Mat fullBinary = cv::Mat::zeros(originalImage.height, originalImage.width, CV_8UC1);
+    
+    // 使用 OR 操作合并所有二值热力图
+    for (size_t i = 0; i < heatmaps.size(); i++) {
+        const CropRegion& region = cropRegions[i];
+        printf("  Merging region %zu/%zu [%d,%d,%d,%d]...\n", 
+               i + 1, heatmaps.size(), 
+               region.x1, region.y1, region.x2, region.y2);
+        
+        // 将二值热力图缩放到裁剪区域的实际尺寸
+        cv::Mat heatmapResized;
+        cv::resize(heatmaps[i], heatmapResized, 
+                  cv::Size(region.width, region.height), 
+                  0, 0, cv::INTER_NEAREST);  // 二值图使用最近邻插值
+        
+        // 计算在原图中的有效区域
+        int x1 = std::max(0, region.x1);
+        int y1 = std::max(0, region.y1);
+        int x2 = std::min(originalImage.width, region.x2);
+        int y2 = std::min(originalImage.height, region.y2);
+        
+        // 计算在热力图中的对应区域
+        int heatmapX1 = std::max(0, -region.x1);
+        int heatmapY1 = std::max(0, -region.y1);
+        int heatmapWidth = x2 - x1;
+        int heatmapHeight = y2 - y1;
+        
+        if (heatmapWidth <= 0 || heatmapHeight <= 0) {
+            printf("    Warning: Invalid region, skipping...\n");
+            continue;
+        }
+        
+        // 确保 ROI 不越界
+        heatmapWidth = std::min(heatmapWidth, heatmapResized.cols - heatmapX1);
+        heatmapHeight = std::min(heatmapHeight, heatmapResized.rows - heatmapY1);
+        
+        if (heatmapWidth <= 0 || heatmapHeight <= 0) {
+            printf("    Warning: ROI out of bounds, skipping...\n");
+            continue;
+        }
+        
+        // 使用 OR 操作合并二值图
+        for (int y = 0; y < heatmapHeight; y++) {
+            for (int x = 0; x < heatmapWidth; x++) {
+                uchar srcVal = heatmapResized.at<uchar>(heatmapY1 + y, heatmapX1 + x);
+                if (srcVal > 0) {
+                    fullBinary.at<uchar>(y1 + y, x1 + x) = 255;
+                }
+            }
+        }
+    }
+    
+    printf("Binary heatmap merged to full size: %dx%d\n", fullBinary.cols, fullBinary.rows);
+    
+    return fullBinary;
+}
+
+/**
+ * @brief 从二值热力图中提取边界框
+ */
+std::vector<BoundingBox> extractBoxesFromBinaryHeatmap(
+    const cv::Mat& binaryHeatmap,
+    int threshold,
+    int minArea,
+    int expandPercent)
+{
+    printf("Extracting boxes from binary heatmap...\n");
+    printf("  Threshold: %d, Min area: %d, Expand: %d%%\n", threshold, minArea, expandPercent);
+    printf("  Binary heatmap dimensions: %dx%d, type: %d\n", 
+           binaryHeatmap.cols, binaryHeatmap.rows, binaryHeatmap.type());
+    
+    // 使用 connectedComponentsWithStats 直接获取统计信息
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    int numLabels = cv::connectedComponentsWithStats(binaryHeatmap, labels, stats, centroids, 8, CV_32S);
+    printf("  Found %d connected components (including background)\n", numLabels - 1);
+    
+    std::vector<BoundingBox> boxes;
+    
+    // stats 的每一行对应一个连通域，列分别为：[left, top, width, height, area]
+    for (int label = 1; label < numLabels; label++) {
+        int* statRow = stats.ptr<int>(label);
+        int left = statRow[0];
+        int top = statRow[1];
+        int width = statRow[2];
+        int height = statRow[3];
+        int area = statRow[4];
+        
+        // 过滤小区域
+        if (area < minArea) {
+            continue;
+        }
+        
+        // 扩展边界框：使用与旧版本相同的逻辑
+        // 垂直方向扩展：扩展到原来的 (100 + expandPercent)%
+        // 水平方向扩展：扩展与垂直方向相同的像素数
+        int expandPixels = 0;
+        if (expandPercent > 0) {
+            // 垂直方向扩展的像素数
+            int expandY = height * expandPercent / 100;
+            // 上下左右各扩展一半
+            expandPixels = expandY / 2;
+        }
+        
+        // 应用扩展（确保不超出图像边界）
+        int right = left + width;
+        int bottom = top + height;
+        
+        if (expandPixels > 0) {
+            top = std::max(0, top - expandPixels);
+            bottom = std::min(binaryHeatmap.rows, bottom + expandPixels);
+            left = std::max(0, left - expandPixels);
+            right = std::min(binaryHeatmap.cols, right + expandPixels);
+        }
+        
+        BoundingBox bbox;
+        bbox.x1 = left;
+        bbox.y1 = top;
+        bbox.x2 = right;
+        bbox.y2 = bottom;
+        bbox.score = 1.0f;
+        
+        boxes.push_back(bbox);
+    }
+    
+    printf("  Extracted %zu valid boxes\n", boxes.size());
+    
+    return boxes;
+}
+
+/**
  * @brief 从热力图中提取边界框
  */
 std::vector<BoundingBox> extractBoxesFromHeatmap(
@@ -114,14 +266,45 @@ std::vector<BoundingBox> extractBoxesFromHeatmap(
     
     printf("Extracting boxes from heatmap...\n");
     printf("  Threshold: %.3f, Min area: %d, Expand: %d%%\n", threshold, minArea, expandPercent);
+    printf("  Heatmap dimensions: %dx%d, data pointer: %p\n", heatmap.width, heatmap.height, (void*)heatmap.data);
     
-    // 创建 cv::Mat 包装器
-    cv::Mat heatmapMat(heatmap.height, heatmap.width, CV_32FC1, heatmap.data);
+    // 检查数据有效性
+    if (heatmap.data == nullptr) {
+        printf("  ERROR: heatmap.data is nullptr!\n");
+        return std::vector<BoundingBox>();
+    }
+    
+    // 尝试读取前几个像素值（使用指针算术）
+    float* pData = heatmap.data;
+    printf("  Trying to read first pixel...\n");
+    fflush(stdout);
+    float val0 = *pData;
+    printf("  First pixel value: %.4f\n", val0);
+    fflush(stdout);
+    printf("  First 5 pixel values: %.4f, %.4f, %.4f, %.4f, %.4f\n", 
+           val0, *(pData+1), *(pData+2), *(pData+3), *(pData+4));
+    fflush(stdout);
+    
+    // 创建 cv::Mat 包装器（不共享数据，而是复制）
+    cv::Mat heatmapMat = cv::Mat(heatmap.height, heatmap.width, CV_32FC1, heatmap.data).clone();
+    printf("  cv::Mat created: %dx%d, continuous: %d\n", heatmapMat.cols, heatmapMat.rows, heatmapMat.isContinuous());
     
     // 二值化：大于阈值的设为 255，其余设为 0
-    cv::Mat binary;
-    cv::threshold(heatmapMat, binary, threshold, 255.0, cv::THRESH_BINARY);
-    binary.convertTo(binary, CV_8UC1);
+    // 注意：我们的数据已经是 0.0 或 1.0，所以二值化后直接转换为 uint8
+    printf("  Starting binarization (%dx%d pixels)...\n", heatmap.height, heatmap.width);
+    cv::Mat binary(heatmap.height, heatmap.width, CV_8UC1);
+    int processedCount = 0;
+    for (int y = 0; y < heatmap.height; y++) {
+        for (int x = 0; x < heatmap.width; x++) {
+            float val = heatmapMat.at<float>(y, x);
+            binary.at<uchar>(y, x) = (val > threshold) ? 255 : 0;
+            processedCount++;
+            if (processedCount == 1000) {
+                printf("    Processed 1000 pixels, no crash yet...\n");
+            }
+        }
+    }
+    printf("  Binarization completed (manual loop), processed %d pixels\n", processedCount);
     
     // 查找连通域
     cv::Mat labels;
@@ -139,6 +322,8 @@ std::vector<BoundingBox> extractBoxesFromHeatmap(
     std::vector<int> pixelCount(numLabels, 0);
     
     // 一次遍历全图，收集所有连通域的信息
+    printf("  Starting connected components analysis (%dx%d pixels)...\n", labels.rows, labels.cols);
+    int processedPixels = 0;
     for (int y = 0; y < labels.rows; y++) {
         for (int x = 0; x < labels.cols; x++) {
             int label = labels.at<int>(y, x);
@@ -153,8 +338,14 @@ std::vector<BoundingBox> extractBoxesFromHeatmap(
             // 累加分数
             sumVal[label] += heatmapMat.at<float>(y, x);
             pixelCount[label]++;
+            
+            processedPixels++;
+            if (processedPixels % 1000000 == 0) {
+                printf("    Processed %d non-background pixels...\n", processedPixels);
+            }
         }
     }
+    printf("  Connected components analysis completed. Total non-background pixels: %d\n", processedPixels);
     
     // 生成边界框
     std::vector<BoundingBox> boxes;
@@ -315,68 +506,158 @@ HeatmapData mergeHeatmaps(
 {
     printf("Merging %zu heatmaps to original size...\n", heatmaps.size());
     
-    // 创建一个与原图相同尺寸的热力图（初始化为 0）
-    cv::Mat fullHeatmap = cv::Mat::zeros(originalImage.height, originalImage.width, CV_32FC1);
-    cv::Mat countMap = cv::Mat::zeros(originalImage.height, originalImage.width, CV_32FC1);
+    // 检查第一个热力图的类型，决定使用 float 还是 uint8 合并
+    bool isBinary = (heatmaps[0].type() == CV_8UC1);
     
-    // 将所有热力图累加到全图
-    for (size_t i = 0; i < heatmaps.size(); i++) {
-        const CropRegion& region = cropRegions[i];
-        printf("  Merging region %zu/%zu [%d,%d,%d,%d]...\n", 
-               i + 1, heatmaps.size(), 
-               region.x1, region.y1, region.x2, region.y2);
+    if (isBinary) {
+        // 二值化热力图合并：使用最大值操作
+        printf("  Using binary merge mode (uint8)\n");
+        cv::Mat fullHeatmap = cv::Mat::zeros(originalImage.height, originalImage.width, CV_8UC1);
         
-        // 将热力图缩放到裁剪区域的实际尺寸
-        cv::Mat heatmapResized;
-        cv::resize(heatmaps[i], heatmapResized, 
-                  cv::Size(region.width, region.height), 
-                  0, 0, cv::INTER_LINEAR);
-        
-        // 计算在原图中的有效区域（处理边界）
-        int x1 = std::max(0, region.x1);
-        int y1 = std::max(0, region.y1);
-        int x2 = std::min(originalImage.width, region.x2);
-        int y2 = std::min(originalImage.height, region.y2);
-        
-        // 计算在热力图中的对应区域
-        int heatmapX1 = std::max(0, -region.x1);
-        int heatmapY1 = std::max(0, -region.y1);
-        int heatmapWidth = x2 - x1;
-        int heatmapHeight = y2 - y1;
-        
-        if (heatmapWidth <= 0 || heatmapHeight <= 0) {
-            printf("    Warning: Invalid region, skipping...\n");
-            continue;
-        }
-        
-        // 将热力图数据累加到全图中
-        for (int y = 0; y < heatmapHeight; y++) {
-            for (int x = 0; x < heatmapWidth; x++) {
-                float heatmapVal = heatmapResized.at<float>(heatmapY1 + y, heatmapX1 + x);
-                fullHeatmap.at<float>(y1 + y, x1 + x) += heatmapVal;
-                countMap.at<float>(y1 + y, x1 + x) += 1.0f;
+        for (size_t i = 0; i < heatmaps.size(); i++) {
+            const CropRegion& region = cropRegions[i];
+            printf("  Merging region %zu/%zu [%d,%d,%d,%d]...\n", 
+                   i + 1, heatmaps.size(), 
+                   region.x1, region.y1, region.x2, region.y2);
+            
+            // 将二值热力图缩放到裁剪区域的实际尺寸
+            cv::Mat heatmapResized;
+            cv::resize(heatmaps[i], heatmapResized, 
+                      cv::Size(region.width, region.height), 
+                      0, 0, cv::INTER_NEAREST);  // 二值图使用最近邻插值
+            
+            // 计算在原图中的有效区域
+            int x1 = std::max(0, region.x1);
+            int y1 = std::max(0, region.y1);
+            int x2 = std::min(originalImage.width, region.x2);
+            int y2 = std::min(originalImage.height, region.y2);
+            
+            // 计算在热力图中的对应区域
+            int heatmapX1 = std::max(0, -region.x1);
+            int heatmapY1 = std::max(0, -region.y1);
+            int heatmapWidth = x2 - x1;
+            int heatmapHeight = y2 - y1;
+            
+            if (heatmapWidth <= 0 || heatmapHeight <= 0) {
+                printf("    Warning: Invalid region, skipping...\n");
+                continue;
+            }
+            
+            // 确保 ROI 不越界
+            heatmapWidth = std::min(heatmapWidth, heatmapResized.cols - heatmapX1);
+            heatmapHeight = std::min(heatmapHeight, heatmapResized.rows - heatmapY1);
+            
+            if (heatmapWidth <= 0 || heatmapHeight <= 0) {
+                printf("    Warning: ROI out of bounds, skipping...\n");
+                continue;
+            }
+            
+            // 使用最大值合并二值图（手动循环，避免 cv::max 的 ROI 问题）
+            for (int y = 0; y < heatmapHeight; y++) {
+                for (int x = 0; x < heatmapWidth; x++) {
+                    uchar srcVal = heatmapResized.at<uchar>(heatmapY1 + y, heatmapX1 + x);
+                    uchar& dstVal = fullHeatmap.at<uchar>(y1 + y, x1 + x);
+                    if (srcVal > dstVal) {
+                        dstVal = srcVal;
+                    }
+                }
             }
         }
+        
+        printf("Binary heatmap merged to full size: %dx%d\n", fullHeatmap.cols, fullHeatmap.rows);
+        
+        // 转换为 float32 以便后续处理（extractBoxesFromHeatmap 需要 float 输入）
+        // 二值图值为 0 或 255，转换后为 0.0 或 1.0
+        // 直接分配内存并填充，避免 cv::Mat 的内存对齐问题
+        int totalPixels = fullHeatmap.cols * fullHeatmap.rows;
+        printf("  Allocating float array: %d pixels\n", totalPixels);
+        
+        float* floatData = new float[totalPixels];
+        for (int y = 0; y < fullHeatmap.rows; y++) {
+            const uchar* srcRow = fullHeatmap.ptr<uchar>(y);
+            float* dstRow = floatData + y * fullHeatmap.cols;
+            for (int x = 0; x < fullHeatmap.cols; x++) {
+                dstRow[x] = (srcRow[x] > 128) ? 1.0f : 0.0f;
+            }
+        }
+        
+        printf("  Float conversion completed, data pointer=%p\n", (void*)floatData);
+        
+        // 创建 HeatmapData 结构体
+        HeatmapData result;
+        result.width = fullHeatmap.cols;
+        result.height = fullHeatmap.rows;
+        result.channels = 1;
+        result.isValid = true;
+        result.data = floatData;
+        
+        printf("  HeatmapData creation completed\n");
+        
+        return result;
+    } else {
+        // float32 热力图合并：使用累加平均
+        printf("  Using float merge mode (float32)\n");
+        cv::Mat fullHeatmap = cv::Mat::zeros(originalImage.height, originalImage.width, CV_32FC1);
+        cv::Mat countMap = cv::Mat::zeros(originalImage.height, originalImage.width, CV_32FC1);
+        
+        for (size_t i = 0; i < heatmaps.size(); i++) {
+            const CropRegion& region = cropRegions[i];
+            printf("  Merging region %zu/%zu [%d,%d,%d,%d]...\n", 
+                   i + 1, heatmaps.size(), 
+                   region.x1, region.y1, region.x2, region.y2);
+            
+            // 将热力图缩放到裁剪区域的实际尺寸
+            cv::Mat heatmapResized;
+            cv::resize(heatmaps[i], heatmapResized, 
+                      cv::Size(region.width, region.height), 
+                      0, 0, cv::INTER_LINEAR);
+            
+            // 计算在原图中的有效区域
+            int x1 = std::max(0, region.x1);
+            int y1 = std::max(0, region.y1);
+            int x2 = std::min(originalImage.width, region.x2);
+            int y2 = std::min(originalImage.height, region.y2);
+            
+            // 计算在热力图中的对应区域
+            int heatmapX1 = std::max(0, -region.x1);
+            int heatmapY1 = std::max(0, -region.y1);
+            int heatmapWidth = x2 - x1;
+            int heatmapHeight = y2 - y1;
+            
+            if (heatmapWidth <= 0 || heatmapHeight <= 0) {
+                printf("    Warning: Invalid region, skipping...\n");
+                continue;
+            }
+            
+            // 将热力图数据累加到全图中
+            for (int y = 0; y < heatmapHeight; y++) {
+                for (int x = 0; x < heatmapWidth; x++) {
+                    float heatmapVal = heatmapResized.at<float>(heatmapY1 + y, heatmapX1 + x);
+                    fullHeatmap.at<float>(y1 + y, x1 + x) += heatmapVal;
+                    countMap.at<float>(y1 + y, x1 + x) += 1.0f;
+                }
+            }
+        }
+        
+        // 对重叠区域取平均值
+        cv::Mat mergedHeatmap;
+        cv::divide(fullHeatmap, countMap, mergedHeatmap, 1.0, CV_32FC1);
+        
+        printf("Heatmap merged to full size: %dx%d\n", mergedHeatmap.cols, mergedHeatmap.rows);
+        
+        // 创建 HeatmapData 结构体
+        HeatmapData result;
+        result.width = mergedHeatmap.cols;
+        result.height = mergedHeatmap.rows;
+        result.channels = 1;
+        result.isValid = true;
+        
+        // 分配内存并复制数据
+        result.data = new float[result.width * result.height];
+        memcpy(result.data, mergedHeatmap.data, result.width * result.height * sizeof(float));
+        
+        return result;
     }
-    
-    // 对重叠区域取平均值
-    cv::Mat mergedHeatmap;
-    cv::divide(fullHeatmap, countMap, mergedHeatmap, 1.0, CV_32FC1);
-    
-    printf("Heatmap merged to full size: %dx%d\n", mergedHeatmap.cols, mergedHeatmap.rows);
-    
-    // 创建 HeatmapData 结构体
-    HeatmapData result;
-    result.width = mergedHeatmap.cols;
-    result.height = mergedHeatmap.rows;
-    result.channels = 1;
-    result.isValid = true;
-    
-    // 分配内存并复制数据
-    result.data = new float[result.width * result.height];
-    memcpy(result.data, mergedHeatmap.data, result.width * result.height * sizeof(float));
-    
-    return result;
 }
 
 /**
@@ -442,26 +723,83 @@ BGRImage visualizeMergedHeatmap(
         printf("  Drawing %zu bounding boxes...\n", boxes.size());
         for (size_t i = 0; i < boxes.size(); i++) {
             const BoundingBox& box = boxes[i];
-            if (!box.isValid()) continue;
-            
-            // 绿色：B=0, G=255, R=0
             cv::rectangle(resultImage, 
                          cv::Point(box.x1, box.y1), 
-                         cv::Point(box.x2, box.y2),
-                         cv::Scalar(0, 255, 0),  // BGR: Green
-                         1,  // 线宽 1 像素
-                         cv::LINE_8);
+                         cv::Point(box.x2, box.y2), 
+                         cv::Scalar(0, 255, 0), 2);
         }
+        printf("  Bounding boxes drawn\n");
     }
     
-    // 创建返回的 BGRImage
+    // 转换为 BGRImage
     BGRImage result;
     result.data = resultImage;
     result.width = resultImage.cols;
     result.height = resultImage.rows;
-    result.channels = resultImage.channels();
+    result.channels = 3;
     
-    printf("Visualization created: %dx%d\n", result.width, result.height);
+    return result;
+}
+
+/**
+ * @brief 将合并后的二值热力图可视化并叠加到原图
+ */
+BGRImage visualizeMergedHeatmap(
+    const BGRImage& originalImage,
+    const cv::Mat& binaryHeatmap,
+    float alpha,
+    const std::vector<BoundingBox>& boxes)
+{
+    printf("Visualizing binary merged heatmap...\n");
+    
+    // 与原图叠加
+    cv::Mat resultImage;
+    originalImage.data.copyTo(resultImage);
+    
+    // 遍历二值热力图，只在有数值的位置叠加红色
+    int redCount = 0;
+    for (int y = 0; y < binaryHeatmap.rows; y++) {
+        for (int x = 0; x < binaryHeatmap.cols; x++) {
+            uchar heatmapVal = binaryHeatmap.at<uchar>(y, x);
+            
+            // 二值图：大于 128 就显示为红色
+            if (heatmapVal > 128) {
+                cv::Vec3b& origPixel = resultImage.at<cv::Vec3b>(y, x);
+                
+                // 红色：B=0, G=0, R=255
+                // BGR 通道加权混合
+                origPixel[0] = static_cast<uchar>((1.0f - alpha) * origPixel[0]);  // B 通道
+                origPixel[1] = static_cast<uchar>((1.0f - alpha) * origPixel[1]);  // G 通道
+                origPixel[2] = static_cast<uchar>((1.0f - alpha) * origPixel[2] + alpha * 255.0f);  // R 通道
+                
+                redCount++;
+            }
+        }
+    }
+    
+    printf("  Red pixels: %d / %d (%.2f%%)\n", 
+           redCount, binaryHeatmap.rows * binaryHeatmap.cols,
+           (float)redCount / (binaryHeatmap.rows * binaryHeatmap.cols) * 100.0f);
+    
+    // 绘制绿色边界框
+    if (!boxes.empty()) {
+        printf("  Drawing %zu bounding boxes...\n", boxes.size());
+        for (size_t i = 0; i < boxes.size(); i++) {
+            const BoundingBox& box = boxes[i];
+            cv::rectangle(resultImage, 
+                         cv::Point(box.x1, box.y1), 
+                         cv::Point(box.x2, box.y2), 
+                         cv::Scalar(0, 255, 0), 2);
+        }
+        printf("  Bounding boxes drawn\n");
+    }
+    
+    // 转换为 BGRImage
+    BGRImage result;
+    result.data = resultImage;
+    result.width = resultImage.cols;
+    result.height = resultImage.rows;
+    result.channels = 3;
     
     return result;
 }

@@ -414,9 +414,9 @@ int ocr_pipline(
         log_info("ocr_crop", "  Cropped image: %dx%d", croppedImage.width, croppedImage.height);
         
         // 运行 NPU 推理
-        cv::Mat heatmap = detector.detect(croppedImage, targetWidth, targetHeight);
+        cv::Mat heatmapFloat = detector.detect(croppedImage, targetWidth, targetHeight);
         
-        if (heatmap.empty()) {
+        if (heatmapFloat.empty()) {
             log_error("ocr_det", "  Warning: Failed to generate heatmap for region %zu, skipping...", i);
             continue;
         }
@@ -424,13 +424,18 @@ int ocr_pipline(
         // 记录 NPU 推理完成时间
         recordTime(("Step 5." + std::to_string(i + 1) + " - NPU Inference").c_str());
         
+        // 立即二值化，减少内存占用
+        cv::Mat heatmapBinary = binarizeHeatmap(heatmapFloat, 0.1f);
+        log_info("ocr_det", "  Heatmap binarized: %dx%d, type=CV_8UC1 (uint8, memory reduced from 1.2MB to 0.3MB)", 
+               heatmapBinary.cols, heatmapBinary.rows);
+        
         // 每次推理后记录内存
         MemoryInfo currentMem = getMemoryInfo();
         log_info("memory", "  [Memory after region %zu] VmRSS: %.2f MB, VmPeak: %.2f MB",
                i + 1, currentMem.vmRSS / 1024.0, currentMem.vmPeak / 1024.0);
         
-        heatmaps.push_back(heatmap);
-        log_info("ocr_det", "  Heatmap generated: %dx%d, type=CV_32FC1", heatmap.cols, heatmap.rows);
+        heatmaps.push_back(heatmapBinary);
+        log_info("ocr_det", "  Binary heatmap stored: %dx%d", heatmapBinary.cols, heatmapBinary.rows);
     }
     
     log_info("ocr_det", "");
@@ -449,23 +454,17 @@ int ocr_pipline(
     log_info("memory", "");
 
     // 步骤 6: 将所有热力图拼接为原图尺寸（获取热力图数据）
-    log_info("ocr_merge", "Step 6: Merging heatmaps to original size...");
-    HeatmapData mergedHeatmap = mergeHeatmaps(bgrImage, heatmaps, cropRegions);
+    // 使用二值合并函数，因为每个小热力图已经是二值的
+    log_info("ocr_merge", "Step 6: Merging binary heatmaps to original size...");
+    cv::Mat mergedBinaryHeatmap = mergeBinaryHeatmaps(bgrImage, heatmaps, cropRegions);
     
-    if (!mergedHeatmap.checkValid()) {
-        log_error("ocr_merge", "Failed to merge heatmaps!");
-        return -1;
-    }
-    
-    log_info("ocr_merge", "Merged heatmap: %dx%d, channels=%d", 
-           mergedHeatmap.width, mergedHeatmap.height, mergedHeatmap.channels);
     recordTime("Step 6 - Merge Heatmaps");
     printMemoryUsage("Step 6 - After Merge");
     log_info("ocr_merge", "");
     
-    // 步骤 7: 从热力图提取边界框
-    log_info("ocr_postprocess", "Step 7: Extracting bounding boxes from heatmap...");
-    std::vector<BoundingBox> boxes = extractBoxesFromHeatmap(mergedHeatmap, 0.1f, 500, 70);
+    // 步骤 7: 从二值热力图提取边界框
+    log_info("ocr_postprocess", "Step 7: Extracting bounding boxes from binary heatmap...");
+    std::vector<BoundingBox> boxes = extractBoxesFromBinaryHeatmap(mergedBinaryHeatmap, 128, 500, 70);
     
     // 打印所有方框信息
     log_info("ocr_postprocess", "  Detected %zu bounding boxes:", boxes.size());
@@ -510,95 +509,99 @@ int ocr_pipline(
     for (size_t i = 0; i < boxes.size(); i++) {
         const BoundingBox& box = boxes[i];
         
-        // 1. 裁剪方框图像（包括完整大框和小框）
-        std::vector<BGRImage> boxImages = cropTextLinesFromBox(
-            bgrImage,
-            box.x1, box.y1, box.x2, box.y2
-        );
-        
-        if (boxImages.empty()) {
-            log_error("ocr_crop", "  Warning: Failed to crop box %zu, skipping...", i);
-            continue;
-        }
-        
-        // 2. 保存图像到文件（仅在 --save 时）
-        if (saveImages) {
-            for (size_t j = 0; j < boxImages.size(); j++) {
-                std::string fileName = std::to_string(i);
-                if (j > 0) {
-                    fileName += "_" + std::to_string(j);
-                }
-                std::string imagePath = imageFolder + "/" + fileName + ".jpg";
-                
-                if (! saveImage(boxImages[j], imagePath)) {
-                    log_error("file_io", "  Warning: Failed to save image %s, skipping...", imagePath.c_str());
-                    continue;
-                }
+        // 使用作用域块，让 boxImages 在每次循环结束后自动释放
+        {
+            // 1. 裁剪方框图像（包括完整大框和小框）
+            std::vector<BGRImage> boxImages = cropTextLinesFromBox(
+                bgrImage,
+                box.x1, box.y1, box.x2, box.y2
+            );
+            
+            if (boxImages.empty()) {
+                log_error("ocr_crop", "  Warning: Failed to crop box %zu, skipping...", i);
+                continue;
             }
-            log_info("file_io", "  Saved %zu cropped image(s) for box %zu", boxImages.size(), i);
-        }
-        
-        // 3. 对裁剪的图像进行识别
-        if (boxImages.size() == 1) {
-            // 只有大框，直接识别
-            const BGRImage& boxImage = boxImages[0];
-            log_info("ocr_rec", "  Recognizing box %zu (full box, %dx%d)...", i, boxImage.width, boxImage.height);
             
-            OCRRecResult recResult = recognizer.recognize(boxImage);
-            
-            if (recResult.success && !recResult.text.empty()) {
-                log_info("ocr_rec", "    -> Text: \"%s\" (confidence: %.4f)", 
-                       recResult.text.c_str(), recResult.confidence);
-                
-                RecognitionResultWithIndex result;
-                result.boxIndex = i;
-                result.subBoxIndex = 0;
-                result.box = box;
-                result.result = recResult;
-                recognitionResults.push_back(result);
+            // 2. 保存图像到文件（仅在 --save 时）
+            if (saveImages) {
+                for (size_t j = 0; j < boxImages.size(); j++) {
+                    std::string fileName = std::to_string(i);
+                    if (j > 0) {
+                        fileName += "_" + std::to_string(j);
+                    }
+                    std::string imagePath = imageFolder + "/" + fileName + ".jpg";
+                    
+                    if (! saveImage(boxImages[j], imagePath)) {
+                        log_error("file_io", "  Warning: Failed to save image %s, skipping...", imagePath.c_str());
+                        continue;
+                    }
+                }
+                log_info("file_io", "  Saved %zu cropped image(s) for box %zu", boxImages.size(), i);
             }
-        } else {
-            // 存在小框，识别所有小框并合并
-            log_info("ocr_rec", "  Recognizing %zu sub-boxes for box %zu...", boxImages.size() - 1, i);
             
-            std::vector<RecognitionResultWithIndex> subBoxResults;
-            for (size_t j = 1; j < boxImages.size(); j++) {
-                const BGRImage& boxImage = boxImages[j];
-                log_info("ocr_rec", "    Recognizing sub-box %zu_%zu (%dx%d)...", i, j, boxImage.width, boxImage.height);
+            // 3. 对裁剪的图像进行识别
+            if (boxImages.size() == 1) {
+                // 只有大框，直接识别
+                const BGRImage& boxImage = boxImages[0];
+                log_info("ocr_rec", "  Recognizing box %zu (full box, %dx%d)...", i, boxImage.width, boxImage.height);
                 
                 OCRRecResult recResult = recognizer.recognize(boxImage);
                 
                 if (recResult.success && !recResult.text.empty()) {
-                    log_info("ocr_rec", "      -> Text: \"%s\" (confidence: %.4f)", 
-                               recResult.text.c_str(), recResult.confidence);
-                        
+                    log_info("ocr_rec", "    -> Text: \"%s\" (confidence: %.4f)", 
+                           recResult.text.c_str(), recResult.confidence);
+                    
                     RecognitionResultWithIndex result;
                     result.boxIndex = i;
-                    result.subBoxIndex = j;
+                    result.subBoxIndex = 0;
                     result.box = box;
                     result.result = recResult;
-                    subBoxResults.push_back(result);
+                    recognitionResults.push_back(result);
+                }
+            } else {
+                // 存在小框，识别所有小框并合并
+                log_info("ocr_rec", "  Recognizing %zu sub-boxes for box %zu...", boxImages.size() - 1, i);
+                
+                std::vector<RecognitionResultWithIndex> subBoxResults;
+                for (size_t j = 1; j < boxImages.size(); j++) {
+                    const BGRImage& boxImage = boxImages[j];
+                    log_info("ocr_rec", "    Recognizing sub-box %zu_%zu (%dx%d)...", i, j, boxImage.width, boxImage.height);
+                    
+                    OCRRecResult recResult = recognizer.recognize(boxImage);
+                    
+                    if (recResult.success && !recResult.text.empty()) {
+                        log_info("ocr_rec", "      -> Text: \"%s\" (confidence: %.4f)", 
+                                   recResult.text.c_str(), recResult.confidence);
+                            
+                        RecognitionResultWithIndex result;
+                        result.boxIndex = i;
+                        result.subBoxIndex = j;
+                        result.box = box;
+                        result.result = recResult;
+                        subBoxResults.push_back(result);
+                    }
+                }
+                
+                // 合并小框结果
+                if (!subBoxResults.empty()) {
+                    log_info("ocr_rec", "");
+                    log_info("ocr_rec", "  Merging %zu sub-box results for box %zu...", subBoxResults.size(), i);
+                    std::string mergedText = OcrRecNPU::mergeAllTexts(subBoxResults);
+                    
+                    RecognitionResultWithIndex mergedResult;
+                    mergedResult.boxIndex = i;
+                    mergedResult.subBoxIndex = 0;
+                    mergedResult.box = box;
+                    mergedResult.result.text = mergedText;
+                    mergedResult.result.success = true;
+                    mergedResult.result.confidence = subBoxResults[0].result.confidence;
+                    
+                    recognitionResults.push_back(mergedResult);
+                    log_info("ocr_rec", "  Box %zu final merged text: \"%s\"", i, mergedText.c_str());
+                    log_info("ocr_rec", "");
                 }
             }
-            
-            // 合并小框结果
-            if (!subBoxResults.empty()) {
-                log_info("ocr_rec", "");
-                log_info("ocr_rec", "  Merging %zu sub-box results for box %zu...", subBoxResults.size(), i);
-                std::string mergedText = OcrRecNPU::mergeAllTexts(subBoxResults);
-                
-                RecognitionResultWithIndex mergedResult;
-                mergedResult.boxIndex = i;
-                mergedResult.subBoxIndex = 0;
-                mergedResult.box = box;
-                mergedResult.result.text = mergedText;
-                mergedResult.result.success = true;
-                mergedResult.result.confidence = subBoxResults[0].result.confidence;
-                
-                recognitionResults.push_back(mergedResult);
-                log_info("ocr_rec", "  Box %zu final merged text: \"%s\"", i, mergedText.c_str());
-                log_info("ocr_rec", "");
-            }
+            // boxImages 在作用域结束时自动释放
         }
     }
     
@@ -611,7 +614,7 @@ int ocr_pipline(
     if (saveImages) {
         // 步骤 10: 将热力图可视化（带方框）
         log_info("ocr_vis", "Step 10: Visualizing merged heatmap with bounding boxes...");
-        BGRImage visImage = visualizeMergedHeatmap(bgrImage, mergedHeatmap, 0.5f, boxes);
+        BGRImage visImage = visualizeMergedHeatmap(bgrImage, mergedBinaryHeatmap, 0.5f, boxes);
         recordTime("Step 10 - Visualize");
         printMemoryUsage("Step 10 - After Visualization");
         log_info("ocr_vis", "");
@@ -627,14 +630,28 @@ int ocr_pipline(
         recordTime("Step 11 - Save Image");
         printMemoryUsage("Step 11 - After Save");
         log_info("file_io", "");
+        
+        // 可视化完成后立即释放 mergedBinaryHeatmap
+        log_info("resource", "Releasing merged heatmap...");
+        mergedBinaryHeatmap.release();
+        recordTime("Step 12 - Cleanup Merged Heatmap");
+        printMemoryUsage("Step 12 - After Cleanup Merged Heatmap");
+        log_info("resource", "");
     } else {
         log_info("ocr_vis", "Step 11: Skipping visualization save (use --save to enable)");
         log_info("ocr_vis", "");
+        
+        // 不保存可视化时也释放 mergedBinaryHeatmap
+        log_info("resource", "Releasing merged heatmap...");
+        mergedBinaryHeatmap.release();
+        recordTime("Step 12 - Cleanup Merged Heatmap");
+        printMemoryUsage("Step 12 - After Cleanup Merged Heatmap");
+        log_info("resource", "");
     }
     
     // 步骤 12: 对象离开作用域，自动释放 NPU 资源和热力图数据
     log_info("resource", "Step 12: Destroying objects...");
-    // detector, image, heatmaps, mergedHeatmap, boxes 等对象会自动调用析构函数
+    // detector, image, boxes 等对象会自动调用析构函数
     log_info("resource", "All objects destroyed, resources released automatically");
     recordTime("Step 12 - Cleanup");
     printMemoryUsage("Step 12 - After Cleanup");
